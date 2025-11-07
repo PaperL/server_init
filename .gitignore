@@ -1,0 +1,7 @@
+.vscode
+archive
+*.bak
+*.tar
+.server_init_state.json
+
+logs
