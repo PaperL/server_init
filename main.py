@@ -23,6 +23,8 @@ import shlex
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from typing import Iterable, List, Optional, Sequence
 
 
@@ -120,6 +122,27 @@ class ExecutionOptions:
 	sudo_allowed: bool
 	force: bool
 	auto_confirm: bool
+
+
+MARKER_DIR_NAME = ".server_init_markers"
+
+
+def task_marker(paths: PathsConfig, key: str) -> pathlib.Path:
+	return paths.home_dir / MARKER_DIR_NAME / f"{key}.done"
+
+
+def is_task_marked_complete(paths: PathsConfig, key: str) -> bool:
+	return task_marker(paths, key).exists()
+
+
+def mark_task_complete(paths: PathsConfig, key: str, options: ExecutionOptions) -> None:
+	marker = task_marker(paths, key)
+	if options.dry_run:
+		print(f"(dry-run) Would record completion marker at {marker}.")
+		return
+	marker.parent.mkdir(parents=True, exist_ok=True)
+	marker.write_text(_dt.datetime.now().isoformat(), encoding="utf-8")
+	print(f"Recorded completion marker at {marker}.")
 
 
 # -- helpers --------------------------------------------------------------------
@@ -279,6 +302,25 @@ class CommandRunner:
 		return proc
 
 
+def fetch_github_keys(username: str) -> List[str]:
+	url = f"https://github.com/{username}.keys"
+	request = urllib.request.Request(url, headers={"User-Agent": "server-init/1.0"})
+	try:
+		with urllib.request.urlopen(request, timeout=10) as response:
+			status = getattr(response, "status", response.getcode())
+			if status != 200:
+				print(f"Failed to fetch keys for GitHub user '{username}' (HTTP {status}).")
+				return []
+			data = response.read().decode("utf-8", errors="ignore")
+	except urllib.error.URLError as exc:
+		print(f"Failed to fetch keys for GitHub user '{username}': {exc}")
+		return []
+	keys = [line.strip() for line in data.splitlines() if line.strip()]
+	if not keys:
+		print(f"No public keys found for GitHub user '{username}'.")
+	return keys
+
+
 # -- menu helpers ---------------------------------------------------------------
 
 
@@ -355,6 +397,8 @@ def task_os_settings(runner: CommandRunner, options: ExecutionOptions, paths: Pa
 		):
 			print("Manual switch to another user is required before rerunning the script.")
 
+	mark_task_complete(paths, "os", options)
+
 
 def task_ssh_setup(runner: CommandRunner, options: ExecutionOptions, paths: PathsConfig) -> None:
 	print("\n[SSH setup] Preparing ~/.ssh/authorized_keys flow.")
@@ -363,7 +407,53 @@ def task_ssh_setup(runner: CommandRunner, options: ExecutionOptions, paths: Path
 		paths.ssh_authorized_keys.touch(exist_ok=True)
 	runner.run(["chmod", "700", str(paths.ssh_authorized_keys.parent)], sudo=False)
 	runner.run(["chmod", "600", str(paths.ssh_authorized_keys)], sudo=False)
-	print("Add keys via GitHub, ssh-agent, or manual input in future iterations.")
+
+	default_username = (
+		os.environ.get("GITHUB_USERNAME")
+		or os.environ.get("GH_USERNAME")
+		or os.environ.get("GH_USER")
+		or ""
+	)
+	github_username = default_username
+	if not options.auto_confirm:
+		prompt = "GitHub username for SSH keys"
+		if default_username:
+			prompt += f" [{default_username}]"
+		prompt += ": "
+		user_input = input(prompt).strip()
+		if user_input:
+			github_username = user_input
+	elif not github_username:
+		print("Auto-confirm enabled but no GitHub username provided via environment; skipping key download.")
+
+	if github_username:
+		keys = fetch_github_keys(github_username)
+		if keys:
+			existing_keys: set[str] = set()
+			if paths.ssh_authorized_keys.exists():
+				existing_content = paths.ssh_authorized_keys.read_text(encoding="utf-8", errors="ignore")
+				existing_keys = {
+					line.strip()
+					for line in existing_content.splitlines()
+					if line.strip() and not line.startswith("#")
+				}
+			new_keys = [key for key in keys if key not in existing_keys]
+			if not new_keys:
+				print(f"All keys for GitHub user '{github_username}' are already present in {paths.ssh_authorized_keys}.")
+			else:
+				timestamp = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+				if options.dry_run:
+					print(f"(dry-run) Would append {len(new_keys)} keys for '{github_username}' to {paths.ssh_authorized_keys}.")
+				else:
+					with paths.ssh_authorized_keys.open("a", encoding="utf-8") as fh:
+						fh.write(f"\n# GitHub keys for {github_username} added {timestamp}\n")
+						for key in new_keys:
+							fh.write(f"{key}\n")
+					print(f"Added {len(new_keys)} keys for GitHub user '{github_username}'.")
+	else:
+		print("No GitHub username provided; skipping public key download.")
+
+	mark_task_complete(paths, "ssh", options)
 
 
 def task_custom_zsh(runner: CommandRunner, options: ExecutionOptions, paths: PathsConfig) -> None:
@@ -414,6 +504,21 @@ def task_custom_zsh(runner: CommandRunner, options: ExecutionOptions, paths: Pat
 	]
 	for cmd, sudo in commands:
 		runner.run(cmd, sudo=sudo)
+
+	current_shell = os.environ.get("SHELL", "")
+	zsh_path = shutil.which("zsh")
+	if not zsh_path:
+		zsh_path = "/usr/bin/zsh"
+	target_user = paths.home_dir.name or getpass.getuser()
+	if current_shell.endswith("zsh") and target_user == getpass.getuser():
+		print("Default shell already set to zsh; skipping chsh.")
+	else:
+		chsh_cmd: List[str] = ["chsh", "-s", zsh_path]
+		sudo_for_chsh = False
+		if target_user and target_user != getpass.getuser():
+			chsh_cmd.append(target_user)
+			sudo_for_chsh = True
+		runner.run(chsh_cmd, sudo=sudo_for_chsh)
 
 	if not options.dry_run:
 		paths.home_dir.mkdir(parents=True, exist_ok=True)
@@ -493,6 +598,13 @@ def task_custom_zsh(runner: CommandRunner, options: ExecutionOptions, paths: Pat
 			paths.p10k.write_text(new_line, encoding="utf-8")
 			print(f"Created {paths.p10k} with OS icon color {color_id}.")
 
+	print(
+		"Atuin reminder: set sync_address = \"http://170.9.246.109:11040\" in "
+		f"{paths.home_dir / '.config' / 'atuin' / 'config.toml'} and run 'atuin login' to use PaperL's self-hosted server."
+	)
+
+	mark_task_complete(paths, "zsh", options)
+
 
 def task_miniconda(runner: CommandRunner, options: ExecutionOptions, paths: PathsConfig, arch: str) -> None:
 	print("\n[Miniconda] Checking/installing under ~/toolchain/miniconda3.")
@@ -533,7 +645,64 @@ def task_miniconda(runner: CommandRunner, options: ExecutionOptions, paths: Path
 
 	# Post-install configuration using the detected/target conda
 	runner.run([str(conda_bin), "config", "--set", "auto_activate_base", "false"])
-	runner.run([str(conda_bin), "create", "-y", "-n", "py12", "python=3.12"])
+
+	env_dir = prefix / "envs" / "py12"
+	if env_dir.exists():
+		print(f"Conda environment 'py12' already exists at {env_dir}. Skipping creation.")
+	else:
+		tos_channels = [
+			"https://repo.anaconda.com/pkgs/main",
+			"https://repo.anaconda.com/pkgs/r",
+		]
+		accept_tos = prompt_yes_no(
+			"Accept Anaconda Terms of Service for repo.anaconda.com channels?",
+			default=True,
+			auto_confirm=options.auto_confirm,
+		)
+		if not accept_tos:
+			print("Cannot proceed with Miniconda environment creation without accepting the Terms of Service.")
+			return
+
+		for channel in tos_channels:
+			if options.dry_run:
+				print(f"(dry-run) Would run: {conda_bin} tos accept --override-channels --channel {channel}")
+			else:
+				runner.run(
+					[
+						str(conda_bin),
+						"tos",
+						"accept",
+						"--override-channels",
+						"--channel",
+						channel,
+					],
+					sudo=False,
+				)
+
+		runner.run([str(conda_bin), "create", "-y", "-n", "py12", "python=3.12"])
+
+	runner.run([str(conda_bin), "init", "zsh"])
+
+	activation_line = "conda activate py12"
+	if paths.zshrc.exists():
+		existing = paths.zshrc.read_text(encoding="utf-8")
+		if activation_line not in existing:
+			if options.dry_run:
+				print(f"(dry-run) Would append '{activation_line}' to {paths.zshrc}.")
+			else:
+				with paths.zshrc.open("a", encoding="utf-8") as fh:
+					if not existing.endswith("\n"):
+						fh.write("\n")
+					fh.write(f"{activation_line}\n")
+	else:
+		if options.dry_run:
+			print(f"(dry-run) Would create {paths.zshrc} with '{activation_line}'.")
+		else:
+			paths.zshrc.parent.mkdir(parents=True, exist_ok=True)
+			paths.zshrc.write_text(f"{activation_line}\n", encoding="utf-8")
+			print(f"Created {paths.zshrc} with '{activation_line}'.")
+
+	mark_task_complete(paths, "conda", options)
 
 
 def task_git_setup(runner: CommandRunner, options: ExecutionOptions, paths: PathsConfig) -> None:
@@ -548,6 +717,8 @@ def task_git_setup(runner: CommandRunner, options: ExecutionOptions, paths: Path
 		runner.run(["git", "config", "--global", "user.name", username], sudo=False)
 	if email:
 		runner.run(["git", "config", "--global", "user.email", email], sudo=False)
+
+	mark_task_complete(paths, "git", options)
 
 
 TASK_IMPLEMENTATIONS = {
@@ -737,6 +908,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 			if should_skip(task.key, context):
 				print(f"Skipping {task.title} due to context rules.")
 				continue
+			if not args.force and is_task_marked_complete(paths, task.key):
+				marker = task_marker(paths, task.key)
+				print(f"Skipping {task.title} (already completed at {marker}).")
+				completed[task.key] = True
+				continue
 			if completed.get(task.key) and not args.force:
 				print(f"Skipping {task.title} (already completed; use --force to rerun).")
 				continue
@@ -765,7 +941,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 		f"  Log file: {log_path}",
 	]
 	print("\n".join(summary_lines))
-	print("Next steps: review the log, adjust plan.md as tasks mature, re-run with --force to execute commands.")
+	if options.dry_run:
+		print("Next steps: review the log, adjust plan.md as tasks mature, re-run with --force to execute commands.")
+	else:
+		print("Next steps: review the log and rerun tasks if further adjustments are needed.")
 	return 0
 
 

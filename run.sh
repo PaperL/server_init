@@ -15,7 +15,7 @@ detect_python() {
       return 0
     fi
   fi
-  for candidate in python python3; do
+  for candidate in python3 python; do
     if command -v "$candidate" >/dev/null 2>&1; then
       PYTHON_BIN=$(command -v "$candidate")
       return 0
@@ -29,9 +29,17 @@ ensure_simple_term_menu() {
     echo "Python interpreter not found. Install Python 3 and retry." >&2
     exit 1
   }
-  cat >&2 <<'EOF'
-simple-term-menu is required. Install it with:
+cat >&2 <<'EOF'
+simple-term-menu is required. Install it with one of the following:
+
+  # Using pip from PyPI
   pip install simple-term-menu
+
+  # OR download the source tarball and install manually
+  wget https://pypi.org/packages/source/s/simple-term-menu/simple_term_menu-1.6.6.tar.gz
+  tar -xvf simple_term_menu-1.6.6.tar.gz
+  cd simple_term_menu-1.6.6
+  sudo python setup.py install
 EOF
   exit 1
 }
